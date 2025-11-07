@@ -1,728 +1,641 @@
-<?php
-// supermarket.php -- Single-file Supermarket System (demo)
-// Requirements: PHP + MySQL, mysqli extension
-// Usage: place in server root and visit in browser. First visit: ?install=1 to create DB/tables
-
-/* ========== CONFIG ========== */
-$db_host = '127.0.0.1';
-$db_user = 'root';
-$db_pass = '';         // change if needed
-$db_name = 'supermarket_db';
-$admin_default_pass = 'admin123'; // default admin password (will be hashed on install)
-/* ============================ */
-
-session_start();
-
-/* ----- Connect DB ----- */
-$mysqli = new mysqli($db_host, $db_user, $db_pass);
-if ($mysqli->connect_error) {
-    die("DB Connect Error: " . $mysqli->connect_error);
-}
-
-/* ----- INSTALL ROUTE ----- */
-if (isset($_GET['install']) && $_GET['install'] == '1') {
-    // create DB and tables
-    $q = "CREATE DATABASE IF NOT EXISTS `$db_name` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci";
-    $mysqli->query($q);
-    $mysqli->select_db($db_name);
-
-    $stmts = [];
-
-// users
-$stmts[] = "CREATE TABLE IF NOT EXISTS users (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  username VARCHAR(100) NOT NULL UNIQUE,
-  password_hash VARCHAR(255) NOT NULL,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;";
-
-// items
-$stmts[] = "CREATE TABLE IF NOT EXISTS items (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  name VARCHAR(150) NOT NULL,
-  sku VARCHAR(100) DEFAULT NULL,
-  price DECIMAL(10,2) NOT NULL DEFAULT 0.00,
-  quantity INT NOT NULL DEFAULT 0,
-  low_stock_threshold INT NOT NULL DEFAULT 5,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP NULL ON UPDATE CURRENT_TIMESTAMP
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;";
-
-// customers
-$stmts[] = "CREATE TABLE IF NOT EXISTS customers (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  name VARCHAR(200) NOT NULL,
-  phone VARCHAR(50) DEFAULT NULL,
-  balance DECIMAL(12,2) DEFAULT 0.00,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;";
-
-// sales
-$stmts[] = "CREATE TABLE IF NOT EXISTS sales (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  total_amount DECIMAL(12,2) NOT NULL,
-  payment_type ENUM('Paid','Credit') NOT NULL,
-  customer_id INT DEFAULT NULL,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE SET NULL
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;";
-
-// sale_items
-$stmts[] = "CREATE TABLE IF NOT EXISTS sale_items (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  sale_id INT NOT NULL,
-  item_id INT NOT NULL,
-  quantity INT NOT NULL,
-  unit_price DECIMAL(10,2) NOT NULL,
-  subtotal DECIMAL(12,2) NOT NULL,
-  FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE,
-  FOREIGN KEY (item_id) REFERENCES items(id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;";
-
-    foreach ($stmts as $s) {
-        if (!$mysqli->query($s)) {
-            echo "Error creating tables: " . $mysqli->error;
-            exit;
-        }
-    }
-
-    // create default admin if not exists
-    $mysqli->select_db($db_name);
-    $u = $mysqli->prepare("SELECT id FROM users WHERE username=?");
-    $username = 'admin';
-    $u->bind_param('s',$username);
-    $u->execute();
-    $u->store_result();
-    if ($u->num_rows == 0) {
-        $passhash = password_hash($admin_default_pass, PASSWORD_DEFAULT);
-        $ins = $mysqli->prepare("INSERT INTO users (username,password_hash) VALUES (?,?)");
-        $ins->bind_param('ss',$username,$passhash);
-        $ins->execute();
-    }
-    echo "<h3>Install completed.</h3>";
-    echo "<p>Default admin: <b>admin</b> / <b>$admin_default_pass</b></p>";
-    echo "<p><a href='supermarket.php'>Go to login</a></p>";
-    exit;
-}
-
-/* ----- Ensure DB selected ----- */
-$mysqli->select_db($db_name);
-$mysqli->set_charset('utf8mb4');
-
-/* ----- Helper functions ----- */
-function is_logged_in() { return isset($_SESSION['user_id']); }
-function ensure_logged_in() { if(!is_logged_in()){ header('Location: supermarket.php'); exit; } }
-function esc($s){ return htmlspecialchars($s,ENT_QUOTES); }
-
-/* ----- ACTIONS: login / logout / item actions / sale actions ----- */
-/* Login */
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action']=='login') {
-    $username = trim($_POST['username'] ?? '');
-    $password = $_POST['password'] ?? '';
-    if ($username=='' || $password=='') {
-        $_SESSION['flash_error'] = 'Fadlan geli username iyo password.';
-        header('Location: supermarket.php'); exit;
-    }
-    $stmt = $mysqli->prepare("SELECT id,password_hash FROM users WHERE username=? LIMIT 1");
-    $stmt->bind_param('s',$username); $stmt->execute();
-    $stmt->bind_result($id,$hash);
-    if ($stmt->fetch()) {
-        if (password_verify($password,$hash)) {
-            $_SESSION['user_id']=$id;
-            $_SESSION['username']=$username;
-            header('Location: supermarket.php?page=dashboard'); exit;
-        } else {
-            $_SESSION['flash_error']='Username ama password khalad ah.';
-            header('Location: supermarket.php'); exit;
-        }
-    } else {
-        $_SESSION['flash_error']='Username ama password khalad ah.';
-        header('Location: supermarket.php'); exit;
-    }
-}
-
-/* Logout */
-if (isset($_GET['action']) && $_GET['action']=='logout') {
-    session_destroy();
-    header('Location: supermarket.php'); exit;
-}
-
-/* Item add/edit/delete via POST */
-if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['action']) && in_array($_POST['action'],['item_add','item_edit','item_delete'])) {
-    ensure_logged_in();
-    $act = $_POST['action'];
-    if ($act=='item_add') {
-        $name = trim($_POST['name'] ?? '');
-        $price = floatval($_POST['price'] ?? 0);
-        $qty = intval($_POST['quantity'] ?? 0);
-        $threshold = intval($_POST['low_stock_threshold'] ?? 5);
-        if ($name=='') { $_SESSION['flash_error']='Name required'; header('Location: supermarket.php?page=items'); exit; }
-        $st = $mysqli->prepare("INSERT INTO items (name,price,quantity,low_stock_threshold) VALUES (?,?,?,?)");
-        $st->bind_param('siii', $name, $price, $qty, $threshold);
-        $st->execute();
-        $_SESSION['flash_success']='Item added';
-        header('Location: supermarket.php?page=items'); exit;
-    } elseif ($act=='item_edit') {
-        $id = intval($_POST['id'] ?? 0);
-        $name = trim($_POST['name'] ?? '');
-        $price = floatval($_POST['price'] ?? 0);
-        $qty = intval($_POST['quantity'] ?? 0);
-        $threshold = intval($_POST['low_stock_threshold'] ?? 5);
-        if ($id<=0) { $_SESSION['flash_error']='Invalid item'; header('Location: supermarket.php?page=items'); exit; }
-        $st = $mysqli->prepare("UPDATE items SET name=?, price=?, quantity=?, low_stock_threshold=? WHERE id=?");
-        $st->bind_param('siiii',$name,$price,$qty,$threshold,$id);
-        $st->execute();
-        $_SESSION['flash_success']='Item updated';
-        header('Location: supermarket.php?page=items'); exit;
-    } elseif ($act=='item_delete') {
-        $id = intval($_POST['id'] ?? 0);
-        if ($id>0) {
-            $st = $mysqli->prepare("DELETE FROM items WHERE id=?");
-            $st->bind_param('i',$id);
-            $st->execute();
-            $_SESSION['flash_success']='Item deleted';
-        }
-        header('Location: supermarket.php?page=items'); exit;
-    }
-}
-
-/* Sale save (AJAX POST JSON) */
-if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_GET['save_sale']) && $_GET['save_sale']=='1') {
-    ensure_logged_in();
-    // read raw JSON
-    $data = json_decode(file_get_contents('php://input'), true);
-    if (!$data) { http_response_code(400); echo json_encode(['success'=>false,'error'=>'Invalid data']); exit; }
-    $cart = $data['cart'] ?? [];
-    $payment = $data['payment_type'] ?? 'Paid';
-    $customer_name = trim($data['customer_name'] ?? '');
-    if (!is_array($cart) || count($cart)==0) { echo json_encode(['success'=>false,'error'=>'Cart empty']); exit; }
-    // compute total and validate stock
-    $mysqli->begin_transaction();
-    try {
-        $total = 0;
-        // check stock for each item from DB
-        foreach ($cart as $line) {
-            $item_id = intval($line['id']);
-            $qty = intval($line['qty']);
-            $res = $mysqli->prepare("SELECT name,quantity,price FROM items WHERE id=? FOR UPDATE");
-            $res->bind_param('i',$item_id); $res->execute(); $res->bind_result($iname,$iqty,$iprice);
-            if (!$res->fetch()) throw new Exception("Item not found (id:$item_id)");
-            $res->close();
-            if ($qty <=0) throw new Exception("Quantity must be > 0 for item $iname");
-            if ($iqty < $qty) throw new Exception("Item '$iname' only has $iqty available, requested $qty");
-            $total += $qty * floatval($iprice);
-        }
-        // If Credit, ensure customer name provided or use existing id
-        $customer_id = null;
-        if ($payment === 'Credit') {
-            if ($customer_name == '') throw new Exception("Magaca macaamiisha waa khasab marka credit la doorto.");
-            // check if customer exists by exact name; if not insert
-            $s = $mysqli->prepare("SELECT id FROM customers WHERE name=? LIMIT 1");
-            $s->bind_param('s',$customer_name); $s->execute(); $s->bind_result($cid);
-            if ($s->fetch()) { $customer_id = $cid; $s->close(); }
-            else {
-                $s->close();
-                $insc = $mysqli->prepare("INSERT INTO customers (name,balance) VALUES (?,0)");
-                $insc->bind_param('s',$customer_name); $insc->execute();
-                $customer_id = $insc->insert_id;
-            }
-        }
-
-        // insert sale
-        $ins = $mysqli->prepare("INSERT INTO sales (total_amount,payment_type,customer_id) VALUES (?,?,?)");
-        $ins->bind_param('dsi',$total,$payment,$customer_id);
-        $ins->execute();
-        $sale_id = $ins->insert_id;
-
-        // insert sale_items and decrement stock
-        foreach ($cart as $line) {
-            $item_id = intval($line['id']);
-            $qty = intval($line['qty']);
-            // fetch unit price fresh
-            $r = $mysqli->prepare("SELECT price FROM items WHERE id=?");
-            $r->bind_param('i',$item_id); $r->execute(); $r->bind_result($unit_price); $r->fetch(); $r->close();
-            $subtotal = $qty * floatval($unit_price);
-            $insl = $mysqli->prepare("INSERT INTO sale_items (sale_id,item_id,quantity,unit_price,subtotal) VALUES (?,?,?,?,?)");
-            $insl->bind_param('iiidd',$sale_id,$item_id,$qty,$unit_price,$subtotal); $insl->execute();
-            // decrement
-            $dec = $mysqli->prepare("UPDATE items SET quantity = quantity - ? WHERE id=?");
-            $dec->bind_param('ii',$qty,$item_id); $dec->execute();
-        }
-
-        // if credit update customer's balance
-        if ($payment === 'Credit' && $customer_id) {
-            $up = $mysqli->prepare("UPDATE customers SET balance = balance + ? WHERE id=?");
-            $up->bind_param('di',$total,$customer_id); $up->execute();
-        }
-
-        $mysqli->commit();
-        echo json_encode(['success'=>true,'sale_id'=>$sale_id]);
-        exit;
-    } catch (Exception $e) {
-        $mysqli->rollback();
-        echo json_encode(['success'=>false,'error'=>$e->getMessage()]);
-        exit;
-    }
-}
-
-/* ----- UI Rendering ----- */
-/* Top layout header assets */
-function page_header($title='Supermarket System'){
-    ?>
 <!doctype html>
-<html lang="en">
+<html lang="so">
 <head>
-  <meta charset="utf-8">
-  <title><?php echo esc($title); ?></title>
-  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Kalkaal Supermarket System</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
   <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
   <style>
-    body{background:#f8fbff;}
-    .nav-brand{font-weight:600;color:#0d6efd;}
-    .low-badge{background:#ffc107;color:#000;padding:3px 6px;border-radius:6px;font-size:12px;}
+    body { background: #f4fbff; }
+    .brand { color:#0d6efd; font-weight:700; }
+    .low-badge { background:#ffc107; color:#000; padding:3px 7px; border-radius:6px; font-weight:600; }
+    .nav-link { cursor:pointer; }
+    .card { box-shadow: 0 1px 4px rgba(13,110,253,0.06); }
+    .small-muted { font-size:0.85rem; color:#6c757d; }
+    .table-sm td, .table-sm th { vertical-align: middle; }
   </style>
 </head>
 <body>
-<nav class="navbar navbar-expand bg-white border-bottom">
-  <div class="container-fluid">
-    <a class="navbar-brand nav-brand" href="supermarket.php?page=dashboard">Supermarket</a>
-    <div class="ms-auto">
-      <?php if(is_logged_in()): ?>
-        <span class="me-3">Admin: <?php echo esc($_SESSION['username']); ?></span>
-        <a class="btn btn-outline-secondary btn-sm" href="supermarket.php?action=logout">Logout</a>
-      <?php endif; ?>
+  <nav class="navbar navbar-light bg-white border-bottom">
+    <div class="container-fluid">
+      <span class="navbar-brand brand">Kalkaal Supermarket System</span>
+      <div id="nav-right"></div>
     </div>
-  </div>
-</nav>
-<div class="container py-4">
-<?php
-}
+  </nav>
 
-/* Footer */
-function page_footer(){
-    ?>
-</div>
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
-</body>
-</html>
-<?php
-}
-
-/* Flash helper */
-function show_flash(){
-    if (!empty($_SESSION['flash_error'])) {
-        echo "<div class='alert alert-danger'>".esc($_SESSION['flash_error'])."</div>";
-        unset($_SESSION['flash_error']);
-    }
-    if (!empty($_SESSION['flash_success'])) {
-        echo "<div class='alert alert-success'>".esc($_SESSION['flash_success'])."</div>";
-        unset($_SESSION['flash_success']);
-    }
-}
-
-/* ROUTE: login page (default) */
-$page = $_GET['page'] ?? '';
-if (!is_logged_in()) {
-    // show login form
-    page_header('Login - Supermarket');
-    show_flash();
-    ?>
-    <div class="row justify-content-center">
+  <div class="container py-4" id="app">
+    <!-- Login -->
+    <div id="loginView" class="row justify-content-center">
       <div class="col-md-5">
         <div class="card shadow-sm">
           <div class="card-body">
-            <h4 class="mb-3">Admin Login</h4>
-            <form method="post" action="supermarket.php">
-              <input type="hidden" name="action" value="login">
+            <h4 class="mb-3 text-center">Admin Login</h4>
+            <form id="loginForm">
               <div class="mb-3">
                 <label class="form-label">Username</label>
-                <input name="username" class="form-control" required>
+                <input id="loginUser" class="form-control" required>
               </div>
               <div class="mb-3">
                 <label class="form-label">Password</label>
-                <input name="password" type="password" class="form-control" required>
+                <input id="loginPass" type="password" class="form-control" required>
               </div>
-              <button class="btn btn-primary w-100">Login</button>
+              <button class="btn btn-primary w-100">GALI</button>
             </form>
+            <p class="small-muted mt-2">Username: <b>admin</b> — Password: <b>1234</b></p>
           </div>
         </div>
       </div>
     </div>
-    <?php
-    page_footer();
-    exit;
-}
 
-/* From here user is logged in */
-if ($page == 'dashboard' || $page=='') {
-    // Dashboard
-    page_header('Dashboard - Supermarket');
-    show_flash();
-    // totals
-    $res = $mysqli->query("SELECT COUNT(*) AS total_items FROM items");
-    $total_items = $res->fetch_assoc()['total_items'] ?? 0;
-    $res = $mysqli->query("SELECT COUNT(*) AS lowitems FROM items WHERE quantity <= low_stock_threshold");
-    $low_items = $res->fetch_assoc()['lowitems'] ?? 0;
-    $stmt = $mysqli->prepare("SELECT IFNULL(SUM(total_amount),0) AS total_today FROM sales WHERE DATE(created_at)=CURDATE()");
-    $stmt->execute(); $stmt->bind_result($today_sales); $stmt->fetch(); $stmt->close();
-    // low items list
-    $low_list = $mysqli->query("SELECT id,name,quantity,low_stock_threshold FROM items WHERE quantity <= low_stock_threshold ORDER BY quantity ASC LIMIT 10");
-    ?>
-    <div class="row g-3">
-      <div class="col-md-3">
-        <div class="card p-3">
-          <small>Total items</small>
-          <h3><?php echo (int)$total_items; ?></h3>
+    <!-- Main views -->
+    <div id="mainView" style="display:none;">
+      <div class="row g-3">
+        <div class="col-md-3">
+          <div class="card p-3">
+            <h6>Tirakoob</h6>
+            <div class="mt-2">
+              <div class="mb-2 small-muted">Items guud</div>
+              <h4 id="statItems">0</h4>
+            </div>
+            <div class="mt-2">
+              <div class="mb-2 small-muted">Items ku dhow inay dhamaadaan</div>
+              <h4 id="statLow">0</h4>
+            </div>
+            <div class="mt-2">
+              <div class="mb-2 small-muted">Iibka maanta</div>
+              <h4 id="statToday">0.00</h4>
+            </div>
+            <div class="mt-3">
+              <button class="btn btn-sm btn-outline-secondary w-100 mb-2" onclick="go('items')">Manage Items</button>
+              <button class="btn btn-sm btn-success w-100 mb-2" onclick="go('sales')">Iib Cusub</button>
+              <button class="btn btn-sm btn-primary w-100" onclick="go('reports')">Reports</button>
+            </div>
+          </div>
         </div>
-      </div>
-      <div class="col-md-3">
-        <div class="card p-3">
-          <small>Items near out</small>
-          <h3><?php echo (int)$low_items; ?></h3>
-        </div>
-      </div>
-      <div class="col-md-3">
-        <div class="card p-3">
-          <small>Today's sales</small>
-          <h3><?php echo number_format($today_sales,2); ?> USD</h3>
-        </div>
-      </div>
-      <div class="col-md-3 d-flex align-items-center">
-        <div>
-          <a class="btn btn-primary me-2" href="supermarket.php?page=items">Manage Items</a>
-          <a class="btn btn-success" href="supermarket.php?page=sales">New Sale</a>
-        </div>
-      </div>
-    </div>
 
-    <div class="mt-4">
-      <h5>Items near out</h5>
-      <table class="table table-sm bg-white">
-        <thead><tr><th>Name</th><th>Qty</th><th>Threshold</th></tr></thead>
-        <tbody>
-          <?php while($r=$low_list->fetch_assoc()): ?>
-            <tr>
-              <td><?php echo esc($r['name']); ?></td>
-              <td><?php echo (int)$r['quantity']; ?></td>
-              <td><?php echo (int)$r['low_stock_threshold']; ?></td>
-            </tr>
-          <?php endwhile; ?>
-        </tbody>
-      </table>
-    </div>
+        <div class="col-md-9">
+          <div id="dashboardView">
+            <div class="card p-3 mb-3">
+              <div class="d-flex justify-content-between align-items-center">
+                <h5>Dashboard</h5>
+                <div>
+                  <span class="me-3">Admin: <b id="adminName">admin</b></span>
+                  <button class="btn btn-outline-secondary btn-sm" id="logoutBtn">Logout</button>
+                </div>
+              </div>
+              <p class="small-muted mt-2">Ku soo dhawow Kalkaal Supermarket System — halkaan ka maamul items, iibka iyo warbixinnada.</p>
+            </div>
 
-    <script>
-      const lowCount = <?php echo (int)$low_items; ?>;
-      if (lowCount > 0) {
-        Swal.fire({icon:'warning', title:'Stock Alert', text:`Waxaa jira ${lowCount} item(s) oo ku dhow inay dhamaadaan!`});
-      }
-    </script>
+            <div class="card p-3">
+              <h6>Items Ku Dhaw</h6>
+              <div id="lowItemsList"></div>
+            </div>
+          </div>
 
-    <?php page_footer(); exit;
-}
+          <!-- Items view -->
+          <div id="itemsView" style="display:none;">
+            <div class="card p-3 mb-3 d-flex justify-content-between align-items-center">
+              <h5>Maareynta Items</h5>
+              <div>
+                <button class="btn btn-outline-secondary me-2" onclick="go('dashboard')">Dashboard</button>
+                <button class="btn btn-primary" id="showAddItemBtn">Add Item</button>
+              </div>
+            </div>
 
-/* ROUTE: items */
-if ($page == 'items') {
-    page_header('Items - Supermarket');
-    show_flash();
-    // search
-    $q = $_GET['q'] ?? '';
-    if ($q != '') {
-        $stmt = $mysqli->prepare("SELECT * FROM items WHERE name LIKE CONCAT('%',?,'%') ORDER BY name ASC");
-        $stmt->bind_param('s',$q);
-        $stmt->execute(); $res = $stmt->get_result();
-    } else {
-        $res = $mysqli->query("SELECT * FROM items ORDER BY name ASC");
-    }
-    ?>
-    <div class="d-flex mb-3">
-      <div><a class="btn btn-secondary me-2" href="supermarket.php?page=dashboard">Back</a></div>
-      <div class="ms-auto">
-        <form class="d-flex" method="get" style="gap:8px;">
-          <input type="hidden" name="page" value="items">
-          <input name="q" value="<?php echo esc($q); ?>" class="form-control form-control-sm" placeholder="Search items">
-          <button class="btn btn-sm btn-outline-primary">Search</button>
-        </form>
-      </div>
-    </div>
-
-    <div class="card p-3 mb-3">
-      <h5>Add item</h5>
-      <form method="post" class="row gx-2 gy-2">
-        <input type="hidden" name="action" value="item_add">
-        <div class="col-md-4"><input name="name" class="form-control" placeholder="Name" required></div>
-        <div class="col-md-2"><input name="price" type="number" step="0.01" class="form-control" placeholder="Price" required></div>
-        <div class="col-md-2"><input name="quantity" type="number" class="form-control" placeholder="Quantity" required></div>
-        <div class="col-md-2"><input name="low_stock_threshold" type="number" class="form-control" placeholder="Low threshold" value="5"></div>
-        <div class="col-md-2"><button class="btn btn-primary w-100">Add Item</button></div>
-      </form>
-    </div>
-
-    <table class="table table-hover bg-white">
-      <thead><tr><th>Name</th><th>Price</th><th>Qty</th><th>Threshold</th><th>Actions</th></tr></thead>
-      <tbody>
-        <?php while($row = $res->fetch_assoc()): ?>
-          <tr>
-            <td><?php echo esc($row['name']); ?></td>
-            <td><?php echo number_format($row['price'],2); ?></td>
-            <td>
-              <?php echo (int)$row['quantity']; ?>
-              <?php if ((int)$row['quantity'] <= (int)$row['low_stock_threshold']): ?>
-                <span class="badge text-dark ms-2" style="background:#ffc107">Low</span>
-              <?php endif; ?>
-            </td>
-            <td><?php echo (int)$row['low_stock_threshold']; ?></td>
-            <td>
-              <!-- Edit inline modal trigger -->
-              <button class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#editModal<?php echo $row['id']; ?>">Edit</button>
-              <form method="post" style="display:inline" onsubmit="return confirm('Delete this item?');">
-                <input type="hidden" name="action" value="item_delete">
-                <input type="hidden" name="id" value="<?php echo $row['id']; ?>">
-                <button class="btn btn-sm btn-outline-danger">Delete</button>
+            <div class="card p-3 mb-3">
+              <form id="addItemForm" class="row g-2">
+                <input type="hidden" id="editItemId">
+                <div class="col-md-4"><input id="itemName" class="form-control" placeholder="Magaca item" required></div>
+                <div class="col-md-2"><input id="itemPrice" class="form-control" placeholder="Qiime (USD)" type="number" step="0.01" required></div>
+                <div class="col-md-2"><input id="itemQty" class="form-control" placeholder="Tirada" type="number" required></div>
+                <div class="col-md-2"><input id="itemLow" class="form-control" placeholder="Threshold" type="number" value="5" required></div>
+                <div class="col-md-2"><button class="btn btn-success w-100" id="saveItemBtn">Ku dar / Update</button></div>
               </form>
-            </td>
-          </tr>
+            </div>
 
-          <!-- Edit Modal -->
-          <div class="modal fade" id="editModal<?php echo $row['id']; ?>" tabindex="-1">
-            <div class="modal-dialog">
-              <div class="modal-content">
-                <form method="post">
-                  <div class="modal-header"><h5 class="modal-title">Edit Item</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
-                  <div class="modal-body">
-                    <input type="hidden" name="action" value="item_edit">
-                    <input type="hidden" name="id" value="<?php echo $row['id']; ?>">
-                    <div class="mb-2"><label>Name</label><input name="name" class="form-control" value="<?php echo esc($row['name']); ?>" required></div>
-                    <div class="mb-2"><label>Price</label><input name="price" type="number" step="0.01" class="form-control" value="<?php echo esc($row['price']); ?>" required></div>
-                    <div class="mb-2"><label>Quantity</label><input name="quantity" type="number" class="form-control" value="<?php echo esc($row['quantity']); ?>" required></div>
-                    <div class="mb-2"><label>Low threshold</label><input name="low_stock_threshold" type="number" class="form-control" value="<?php echo esc($row['low_stock_threshold']); ?>"></div>
-                  </div>
-                  <div class="modal-footer"><button class="btn btn-primary">Save</button></div>
-                </form>
+            <div class="card p-3">
+              <h6>Liiska Items</h6>
+              <input id="searchItem" class="form-control mb-2" placeholder="Raadi item...">
+              <div style="max-height:420px; overflow:auto;">
+                <table class="table table-sm">
+                  <thead><tr><th>Magac</th><th>Qiime</th><th>Tirada</th><th>Threshold</th><th>Action</th></tr></thead>
+                  <tbody id="itemsTable"></tbody>
+                </table>
               </div>
             </div>
           </div>
 
-        <?php endwhile; ?>
-      </tbody>
-    </table>
+          <!-- Sales view -->
+          <div id="salesView" style="display:none;">
+            <div class="card p-3 mb-3 d-flex justify-content-between">
+              <h5>Iib Cusub</h5>
+              <div>
+                <button class="btn btn-outline-secondary" onclick="go('dashboard')">Dashboard</button>
+                <button class="btn btn-outline-secondary" onclick="go('items')">Items</button>
+              </div>
+            </div>
 
-    <?php page_footer(); exit;
-}
-
-/* ROUTE: sales */
-if ($page == 'sales') {
-    page_header('New Sale - Supermarket');
-    show_flash();
-    // fetch items for search listing
-    $items = $mysqli->query("SELECT id,name,price,quantity,low_stock_threshold FROM items ORDER BY name ASC")->fetch_all(MYSQLI_ASSOC);
-    // fetch credit customers
-    $custs = $mysqli->query("SELECT id,name,balance FROM customers ORDER BY name ASC")->fetch_all(MYSQLI_ASSOC);
-    ?>
-    <div class="d-flex mb-3">
-      <div><a class="btn btn-secondary" href="supermarket.php?page=dashboard">Back</a></div>
-    </div>
-
-    <div class="row g-3">
-      <div class="col-md-5">
-        <div class="card p-3">
-          <h6>Search items</h6>
-          <input id="searchItem" class="form-control mb-2" placeholder="Type name...">
-          <div id="itemsList" style="max-height:360px; overflow:auto;">
-            <?php foreach($items as $it): ?>
-              <div class="d-flex align-items-center justify-content-between p-2 border-bottom">
-                <div>
-                  <strong><?php echo esc($it['name']); ?></strong><br>
-                  <small><?php echo number_format($it['price'],2); ?> USD — Qty: <?php echo (int)$it['quantity']; ?></small>
-                  <?php if ($it['quantity'] <= $it['low_stock_threshold']): ?>
-                    <span class="badge text-dark ms-2" style="background:#ffc107">Low</span>
-                  <?php endif; ?>
-                </div>
-                <div style="min-width:120px">
-                  <input data-id="<?php echo $it['id']; ?>" data-name="<?php echo esc($it['name']); ?>" data-price="<?php echo $it['price']; ?>" data-qty="<?php echo $it['quantity']; ?>" type="number" min="1" value="1" class="form-control form-control-sm addQty mb-1">
-                  <button class="btn btn-sm btn-primary w-100 addToCartBtn" data-id="<?php echo $it['id']; ?>">Add</button>
+            <div class="row g-3">
+              <div class="col-md-6">
+                <div class="card p-3">
+                  <h6>Item-yada</h6>
+                  <input id="saleSearch" class="form-control mb-2" placeholder="Raadi item...">
+                  <div id="saleItemsList" style="max-height:360px; overflow:auto;"></div>
                 </div>
               </div>
-            <?php endforeach; ?>
-          </div>
-        </div>
-      </div>
 
-      <div class="col-md-7">
-        <div class="card p-3">
-          <h6>Cart</h6>
-          <div id="cartArea">
-            <p class="text-muted">No items in cart.</p>
-          </div>
+              <div class="col-md-6">
+                <div class="card p-3">
+                  <h6>Cart</h6>
+                  <div id="cartArea"><p class="text-muted">Cart waa madhan yahay.</p></div>
 
-          <div class="mt-3 d-flex gap-2">
-            <select id="paymentType" class="form-select w-auto">
-              <option value="Paid">Paid</option>
-              <option value="Credit">Credit</option>
-            </select>
-            <select id="customerSelect" class="form-select w-auto" style="display:none">
-              <option value="">-- Select existing customer --</option>
-              <?php foreach($custs as $c): ?>
-                <option value="<?php echo $c['name']; ?>"><?php echo esc($c['name']).' ('.$c['balance'].')'; ?></option>
-              <?php endforeach; ?>
-            </select>
-            <input id="customerName" class="form-control" placeholder="Customer name (for credit)" style="display:none">
-            <button id="saveSaleBtn" class="btn btn-success ms-auto">Save Sale</button>
+                  <div class="mt-3 d-flex gap-2">
+                    <select id="paymentType" class="form-select w-auto">
+                      <option value="Paid">Paid</option>
+                      <option value="Credit">Credit</option>
+                    </select>
+                    <input id="creditName" class="form-control" placeholder="Magaca macaamiisha (credit)" style="display:none;">
+                    <button id="saveSaleBtn" class="btn btn-success ms-auto">Save Iib</button>
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
 
-        </div>
-      </div>
-    </div>
+          <!-- Reports view -->
+          <div id="reportsView" style="display:none;">
+            <div class="card p-3 mb-3 d-flex justify-content-between">
+              <h5>Warbixinno</h5>
+              <div>
+                <button class="btn btn-outline-secondary" onclick="go('dashboard')">Dashboard</button>
+              </div>
+            </div>
 
-    <script>
-      // Simple client-side cart
-      let items = <?php echo json_encode($items); ?>;
-      let cart = [];
+            <div class="row g-3">
+              <div class="col-md-6">
+                <div class="card p-3">
+                  <h6>Iibka Maanta</h6>
+                  <h3 id="reportTodayTotal">0.00</h3>
+                  <div class="mt-3">
+                    <h6>Credit Customers</h6>
+                    <ul id="reportCredits" class="list-group"></ul>
+                  </div>
+                </div>
+              </div>
 
-      function renderCart(){
-        const area = document.getElementById('cartArea');
-        if(cart.length===0){ area.innerHTML = '<p class="text-muted">No items in cart.</p>'; return; }
-        let h = '<table class="table table-sm"><thead><tr><th>Item</th><th>Qty</th><th>Unit</th><th>Subtotal</th><th></th></tr></thead><tbody>';
-        let total = 0;
-        cart.forEach((c,i)=>{
-          const sub = (c.qty * parseFloat(c.price));
-          total += sub;
-          h += `<tr><td>${c.name}</td><td><input data-i="${i}" class="form-control form-control-sm cartQty" style="width:80px" value="${c.qty}"></td><td>${parseFloat(c.price).toFixed(2)}</td><td>${sub.toFixed(2)}</td><td><button data-i="${i}" class="btn btn-sm btn-outline-danger removeBtn">x</button></td></tr>`;
-        });
-        h += `</tbody></table><div class="text-end"><h5>Total: <span id="totalVal">${total.toFixed(2)}</span> USD</h5></div>`;
-        area.innerHTML = h;
+              <div class="col-md-6">
+                <div class="card p-3">
+                  <h6>Items ku dhow inay dhamaadaan</h6>
+                  <ul id="reportLow" class="list-group"></ul>
+                </div>
+              </div>
+            </div>
+          </div>
+
+        </div> <!-- /col-md-9 -->
+      </div> <!-- /row -->
+    </div> <!-- /mainView -->
+  </div> <!-- /container -->
+
+<script>
+/* ===========================
+   Storage helpers & init
+   =========================== */
+const KEY_ITEMS = 'kalk_items_v1';
+const KEY_SALES = 'kalk_sales_v1';
+const KEY_CUSTOMERS = 'kalk_customers_v1';
+const ADMIN_USER = 'admin';
+const ADMIN_PASS = '1234';
+
+function load(key) {
+  try { return JSON.parse(localStorage.getItem(key) || '[]'); } catch(e) { return []; }
+}
+function save(key, data) { localStorage.setItem(key, JSON.stringify(data)); }
+function uid(prefix='id') { return prefix + '_' + Date.now() + '_' + Math.floor(Math.random()*9000+1000); }
+
+let items = load(KEY_ITEMS);
+let sales = load(KEY_SALES);
+let customers = load(KEY_CUSTOMERS);
+
+/* If empty first time, seed example items (optional) */
+if (!items || items.length === 0) {
+  items = [
+    { id: uid('it'), name: 'Rice 5kg', price: 10.00, quantity: 10, low:5 },
+    { id: uid('it'), name: 'Sugar 2kg', price: 3.50, quantity: 8, low:5 },
+    { id: uid('it'), name: 'Bread', price: 0.50, quantity: 20, low:5 }
+  ];
+  save(KEY_ITEMS, items);
+}
+
+/* ================
+   Auth & UI helpers
+   ================ */
+const loginView = document.getElementById('loginView');
+const mainView = document.getElementById('mainView');
+const navRight = document.getElementById('nav-right');
+
+function showMain() {
+  loginView.style.display = 'none';
+  mainView.style.display = '';
+  navRight.innerHTML = `<div class="d-flex align-items-center"><small class="me-3">Admin: <b>${ADMIN_USER}</b></small></div>`;
+  updateStats();
+  renderLowList();
+  showAlertIfLow();
+}
+
+function logout() {
+  sessionStorage.removeItem('kalk_logged');
+  location.reload();
+}
+
+/* Login form */
+document.getElementById('loginForm').addEventListener('submit', function(e){
+  e.preventDefault();
+  const u = document.getElementById('loginUser').value.trim();
+  const p = document.getElementById('loginPass').value;
+  if (u === ADMIN_USER && p === ADMIN_PASS) {
+    sessionStorage.setItem('kalk_logged','1');
+    showMain();
+    Swal.fire('Sax','Waan ku soo dhaweynayaa','success');
+  } else {
+    Swal.fire('Khalad','Username ama password khalad ah','error');
+  }
+});
+
+/* Auto-login if session */
+if (sessionStorage.getItem('kalk_logged')) {
+  document.getElementById('adminName').innerText = ADMIN_USER;
+  showMain();
+}
+
+/* Logout btn */
+document.getElementById('logoutBtn').addEventListener('click', logout);
+
+/* ================
+   Navigation
+   ================ */
+function hideAllViews() {
+  document.getElementById('dashboardView').style.display = 'none';
+  document.getElementById('itemsView').style.display = 'none';
+  document.getElementById('salesView').style.display = 'none';
+  document.getElementById('reportsView').style.display = 'none';
+}
+function go(page) {
+  hideAllViews();
+  if (page === 'dashboard') document.getElementById('dashboardView').style.display = '';
+  if (page === 'items') document.getElementById('itemsView').style.display = '';
+  if (page === 'sales') document.getElementById('salesView').style.display = '';
+  if (page === 'reports') document.getElementById('reportsView').style.display = '';
+  // refresh data for that view
+  if (page === 'items') renderItemsTable();
+  if (page === 'sales') renderSaleItemsList();
+  if (page === 'reports') renderReports();
+}
+
+/* ================
+   Items CRUD
+   ================ */
+const itemsTable = document.getElementById('itemsTable');
+const addItemForm = document.getElementById('addItemForm');
+const saveItemBtn = document.getElementById('saveItemBtn');
+
+function renderItemsTable(filter='') {
+  items = load(KEY_ITEMS);
+  itemsTable.innerHTML = '';
+  const q = filter.trim().toLowerCase();
+  items.forEach(it => {
+    if (q && !it.name.toLowerCase().includes(q)) return;
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${escapeHtml(it.name)}</td>
+      <td>${parseFloat(it.price).toFixed(2)}</td>
+      <td>${parseInt(it.quantity)} ${it.quantity <= it.low ? `<span class="ms-2 low-badge">Low</span>` : ''}</td>
+      <td>${parseInt(it.low)}</td>
+      <td>
+        <button class="btn btn-sm btn-secondary me-1" data-act="edit" data-id="${it.id}">Edit</button>
+        <button class="btn btn-sm btn-danger" data-act="del" data-id="${it.id}">Delete</button>
+      </td>`;
+    itemsTable.appendChild(tr);
+  });
+}
+
+function escapeHtml(s) {
+  return String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
+}
+
+itemsTable.addEventListener('click', function(e){
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  const act = btn.dataset.act;
+  const id = btn.dataset.id;
+  if (act === 'edit') {
+    const it = items.find(x=>x.id===id);
+    if (!it) return;
+    document.getElementById('editItemId').value = it.id;
+    document.getElementById('itemName').value = it.name;
+    document.getElementById('itemPrice').value = parseFloat(it.price);
+    document.getElementById('itemQty').value = parseInt(it.quantity);
+    document.getElementById('itemLow').value = parseInt(it.low);
+    window.scrollTo({top:0, behavior:'smooth'});
+  } else if (act === 'del') {
+    Swal.fire({
+      title: 'Ma hubtaa?',
+      text: 'Miyaad rabtaa inaad tirtirto itemkan?',
+      icon: 'warning', showCancelButton:true
+    }).then(res=>{
+      if (res.isConfirmed) {
+        items = items.filter(x=>x.id !== id);
+        save(KEY_ITEMS, items);
+        renderItemsTable(document.getElementById('searchItem').value || '');
+        updateStats();
+        Swal.fire('La tirtiray','Item waa la tirtiray','success');
       }
+    });
+  }
+});
 
-      // add to cart
-      document.querySelectorAll('.addToCartBtn').forEach(btn=>{
-        btn.addEventListener('click', function(){
-          const id = this.dataset.id;
-          const qtyInput = this.parentElement.querySelector('.addQty');
-          const qty = parseInt(qtyInput.value) || 1;
-          const it = items.find(x=>x.id==id);
-          if (!it) return;
-          if (qty > parseInt(it.quantity)) { Swal.fire('Error','Qty exceeds available stock','error'); return; }
-          // if exists in cart, add qty
-          const existing = cart.find(x=>x.id==id);
-          if (existing) existing.qty += qty;
-          else cart.push({id:it.id,name:it.name,price:it.price,qty:qty});
-          renderCart();
-        });
-      });
+/* Add/Edit */
+addItemForm.addEventListener('submit', function(e){
+  e.preventDefault();
+  const id = document.getElementById('editItemId').value;
+  const name = document.getElementById('itemName').value.trim();
+  const price = parseFloat(document.getElementById('itemPrice').value) || 0;
+  const qty = parseInt(document.getElementById('itemQty').value) || 0;
+  const low = parseInt(document.getElementById('itemLow').value) || 5;
+  if (!name) return Swal.fire('Khalad','Fadlan geli magaca item','error');
+  if (id) {
+    // edit
+    items = items.map(it => it.id === id ? {...it, name, price, quantity: qty, low } : it);
+    Swal.fire('La cusbooneysiiyey','Item waa la cusbooneysiiyey','success');
+  } else {
+    // add
+    const newItem = { id: uid('it'), name, price, quantity: qty, low };
+    items.push(newItem);
+    Swal.fire('La daray','Item cusub waa la daray','success');
+  }
+  save(KEY_ITEMS, items);
+  document.getElementById('editItemId').value = '';
+  addItemForm.reset();
+  renderItemsTable();
+  updateStats();
+});
 
-      // delegate cart area events
-      document.addEventListener('click', function(e){
-        if (e.target.classList.contains('removeBtn')){
-          const i = e.target.dataset.i; cart.splice(i,1); renderCart();
-        }
-      });
-      document.addEventListener('change', function(e){
-        if (e.target.classList.contains('cartQty')){
-          const i = e.target.dataset.i; let v = parseInt(e.target.value) || 1;
-          // check against available
-          const id = cart[i].id;
-          const it = items.find(x=>x.id==id);
-          if (v > parseInt(it.quantity)) { Swal.fire('Error','Qty exceeds available stock','error'); e.target.value = cart[i].qty; return; }
-          cart[i].qty = v; renderCart();
-        }
-      });
+/* Search */
+document.getElementById('searchItem').addEventListener('input', function(){
+  renderItemsTable(this.value);
+});
 
-      // payment type toggle
-      document.getElementById('paymentType').addEventListener('change', function(){
-        const v = this.value;
-        if (v === 'Credit') {
-          document.getElementById('customerName').style.display='block';
-          document.getElementById('customerSelect').style.display='block';
-        } else {
-          document.getElementById('customerName').style.display='none';
-          document.getElementById('customerSelect').style.display='none';
-        }
-      });
+/* show add item btn */
+document.getElementById('showAddItemBtn').addEventListener('click', function(){
+  document.getElementById('editItemId').value = '';
+  addItemForm.reset();
+  window.scrollTo({top:0, behavior:'smooth'});
+});
 
-      // choose customer populate name
-      const custSel = document.getElementById('customerSelect');
-      if (custSel) custSel.addEventListener('change', function(){
-        document.getElementById('customerName').value = this.value;
-      });
+/* ================
+   Sales (cart)
+   ================ */
+let cart = [];
 
-      // save sale
-      document.getElementById('saveSaleBtn').addEventListener('click', function(){
-        if (cart.length===0){ Swal.fire('Error','Cart is empty','error'); return; }
-        const payment = document.getElementById('paymentType').value;
-        const custName = document.getElementById('customerName').value.trim();
-        if (payment==='Credit' && custName===''){ Swal.fire('Error','Fadlan gali magaca macaamiisha','error'); return; }
-        // prepare data
-        fetch('supermarket.php?save_sale=1', {
-          method:'POST',
-          headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({cart, payment_type: payment, customer_name: custName})
-        }).then(r=>r.json()).then(resp=>{
-          if(resp.success){ Swal.fire('Success','Sale saved').then(()=> location.href='supermarket.php?page=dashboard'); }
-          else Swal.fire('Error', resp.error || 'Could not save sale','error');
-        }).catch(e=> Swal.fire('Error','Network error','error'));
-      });
-
-      // search items filter
-      document.getElementById('searchItem').addEventListener('input', function(){
-        const q = this.value.toLowerCase();
-        document.querySelectorAll('#itemsList > div').forEach(div=>{
-          const name = div.querySelector('strong').innerText.toLowerCase();
-          div.style.display = name.includes(q) ? 'flex' : 'none';
-        });
-      });
-
-    </script>
-
-    <?php page_footer(); exit;
+function renderSaleItemsList() {
+  items = load(KEY_ITEMS);
+  const container = document.getElementById('saleItemsList');
+  container.innerHTML = '';
+  items.forEach(it => {
+    const div = document.createElement('div');
+    div.className = 'd-flex align-items-center justify-content-between p-2 border-bottom';
+    div.innerHTML = `
+      <div>
+        <strong>${escapeHtml(it.name)}</strong><br>
+        <small>${parseFloat(it.price).toFixed(2)} USD — Qty: ${it.quantity}</small>
+        ${it.quantity <= it.low ? ` <span class="low-badge ms-2">Low</span>` : ''}
+      </div>
+      <div style="min-width:140px">
+        <input type="number" value="1" min="1" max="${it.quantity}" class="form-control form-control-sm mb-1 addQty" data-id="${it.id}">
+        <button class="btn btn-sm btn-primary w-100 addToCart" data-id="${it.id}">Add</button>
+      </div>`;
+    container.appendChild(div);
+  });
+  document.getElementById('saleSearch').value = '';
 }
 
-/* ROUTE: reports */
-if ($page == 'reports') {
-    page_header('Reports - Supermarket');
-    show_flash();
-    // total sales today
-    $stmt = $mysqli->prepare("SELECT IFNULL(SUM(total_amount),0) FROM sales WHERE DATE(created_at)=CURDATE()");
-    $stmt->execute(); $stmt->bind_result($today_sum); $stmt->fetch(); $stmt->close();
-    $credits = $mysqli->query("SELECT * FROM customers WHERE balance > 0 ORDER BY balance DESC")->fetch_all(MYSQLI_ASSOC);
-    $lowitems = $mysqli->query("SELECT * FROM items WHERE quantity <= low_stock_threshold ORDER BY quantity ASC")->fetch_all(MYSQLI_ASSOC);
-    ?>
-    <div class="row">
-      <div class="col-md-4">
-        <div class="card p-3">
-          <h6>Today's Sales</h6>
-          <h3><?php echo number_format($today_sum,2); ?> USD</h3>
-        </div>
+/* add to cart from items list */
+document.getElementById('saleItemsList').addEventListener('click', function(e){
+  const btn = e.target.closest('button.addToCart');
+  if (!btn) return;
+  const id = btn.dataset.id;
+  const qtyInput = btn.parentElement.querySelector('.addQty');
+  let q = parseInt(qtyInput.value) || 1;
+  const it = items.find(x=>x.id===id);
+  if (!it) return Swal.fire('Error','Item lama helin','error');
+  if (q > it.quantity) return Swal.fire('Error',`Kaliya ${it.quantity} ayaa la heli karaa`,`error`);
+  addToCart(id, q);
+});
 
-        <div class="card p-3 mt-3">
-          <h6>Credit Customers</h6>
-          <?php if (count($credits)==0) echo "<p class='text-muted'>No credit customers</p>"; ?>
-          <ul class="list-group">
-            <?php foreach($credits as $c): ?>
-              <li class="list-group-item d-flex justify-content-between"><?php echo esc($c['name']); ?><span><?php echo number_format($c['balance'],2); ?></span></li>
-            <?php endforeach; ?>
-          </ul>
-        </div>
-      </div>
+/* search inside sale items */
+document.getElementById('saleSearch').addEventListener('input', function(){
+  const q = this.value.trim().toLowerCase();
+  document.querySelectorAll('#saleItemsList > div').forEach(div=>{
+    const name = div.querySelector('strong').innerText.toLowerCase();
+    div.style.display = name.includes(q) ? 'flex' : 'none';
+  });
+});
 
-      <div class="col-md-8">
-        <div class="card p-3">
-          <h6>Items near out</h6>
-          <table class="table table-sm">
-            <thead><tr><th>Name</th><th>Qty</th><th>Threshold</th></tr></thead>
-            <tbody>
-              <?php foreach($lowitems as $li): ?>
-                <tr><td><?php echo esc($li['name']); ?></td><td><?php echo (int)$li['quantity']; ?></td><td><?php echo (int)$li['low_stock_threshold']; ?></td></tr>
-              <?php endforeach; ?>
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </div>
-    <?php page_footer(); exit;
+/* Cart functions */
+function addToCart(id, q=1) {
+  const it = items.find(x=>x.id===id);
+  if (!it) return;
+  const found = cart.find(x=>x.id===id);
+  if (found) {
+    found.qty += q;
+    if (found.qty > it.quantity) found.qty = it.quantity;
+  } else {
+    cart.push({ id: it.id, name: it.name, price: it.price, qty: q });
+  }
+  renderCart();
 }
 
-/* unknown page: redirect to dashboard */
-header('Location: supermarket.php?page=dashboard');
-exit;
-?>
+function renderCart() {
+  const area = document.getElementById('cartArea');
+  if (cart.length === 0) { area.innerHTML = '<p class="text-muted">Cart waa madhan yahay.</p>'; return; }
+  let html = `<table class="table table-sm"><thead><tr><th>Item</th><th>Qty</th><th>Unit</th><th>Subtotal</th><th></th></tr></thead><tbody>`;
+  let total = 0;
+  cart.forEach((c, idx) => {
+    const sub = c.qty * parseFloat(c.price);
+    total += sub;
+    html += `<tr>
+      <td>${escapeHtml(c.name)}</td>
+      <td><input type="number" min="1" value="${c.qty}" class="form-control form-control-sm cartQty" data-i="${idx}" style="width:90px"></td>
+      <td>${parseFloat(c.price).toFixed(2)}</td>
+      <td>${sub.toFixed(2)}</td>
+      <td><button class="btn btn-sm btn-danger removeLine" data-i="${idx}">x</button></td>
+    </tr>`;
+  });
+  html += `</tbody></table><div class="text-end"><h5>Total: <span id="cartTotal">${total.toFixed(2)}</span> USD</h5></div>`;
+  area.innerHTML = html;
+}
+
+/* delegate cart events */
+document.getElementById('cartArea').addEventListener('click', function(e){
+  const btn = e.target.closest('button.removeLine');
+  if (btn) {
+    const i = parseInt(btn.dataset.i);
+    cart.splice(i,1);
+    renderCart();
+    return;
+  }
+});
+document.getElementById('cartArea').addEventListener('change', function(e){
+  const inp = e.target.closest('input.cartQty');
+  if (!inp) return;
+  const i = parseInt(inp.dataset.i);
+  let v = parseInt(inp.value) || 1;
+  const it = items.find(x=>x.id === cart[i].id);
+  if (v > it.quantity) { Swal.fire('Error','Qty exceeds available stock','error'); inp.value = cart[i].qty; return; }
+  cart[i].qty = v;
+  renderCart();
+});
+
+/* payment type toggle */
+document.getElementById('paymentType').addEventListener('change', function(){
+  const v = this.value;
+  document.getElementById('creditName').style.display = v === 'Credit' ? '' : 'none';
+});
+
+/* save sale */
+document.getElementById('saveSaleBtn').addEventListener('click', function(){
+  if (cart.length === 0) return Swal.fire('Error','Cart waa madhan','error');
+  const payment = document.getElementById('paymentType').value;
+  const custName = document.getElementById('creditName').value.trim();
+  if (payment === 'Credit' && !custName) return Swal.fire('Error','Fadlan gali magaca macaamiisha (credit)','error');
+
+  // validate stock again
+  items = load(KEY_ITEMS);
+  try {
+    cart.forEach(c => {
+      const it = items.find(x=>x.id===c.id);
+      if (!it) throw new Error(`Item ${c.name} lama helin`);
+      if (c.qty > it.quantity) throw new Error(`Item '${it.name}' kaliya ${it.quantity} ayaa la heli karaa, codsatay ${c.qty}`);
+    });
+  } catch(err) { return Swal.fire('Error', err.message, 'error'); }
+
+  // compute total
+  let total = 0;
+  cart.forEach(c => total += c.qty * parseFloat(c.price));
+  total = parseFloat(total.toFixed(2));
+
+  // create sale entry
+  const sale = { id: uid('s'), total, payment, customer: payment==='Credit' ? custName : null, date: new Date().toISOString(), lines: cart.map(c=>({...c})) };
+  sales = load(KEY_SALES);
+  sales.push(sale);
+  save(KEY_SALES, sales);
+
+  // decrement stock
+  items = items.map(it => {
+    const line = cart.find(l => l.id === it.id);
+    if (line) {
+      return {...it, quantity: it.quantity - line.qty};
+    }
+    return it;
+  });
+  save(KEY_ITEMS, items);
+
+  // handle credit customer
+  if (payment === 'Credit') {
+    customers = load(KEY_CUSTOMERS);
+    let c = customers.find(x => x.name.toLowerCase() === custName.toLowerCase());
+    if (c) c.balance = parseFloat((parseFloat(c.balance) + total).toFixed(2));
+    else {
+      c = { id: uid('c'), name: custName, balance: total };
+      customers.push(c);
+    }
+    save(KEY_CUSTOMERS, customers);
+  }
+
+  // clear cart
+  cart = [];
+  renderCart();
+  renderSaleItemsList();
+  renderItemsTable();
+  updateStats();
+  showAlertIfLow();
+  Swal.fire('Saved','Iibka waa la keydiyey','success');
+});
+
+/* ================
+   Reports & stats
+   ================ */
+function updateStats(){
+  items = load(KEY_ITEMS);
+  sales = load(KEY_SALES);
+  customers = load(KEY_CUSTOMERS);
+  document.getElementById('statItems').innerText = items.length;
+  const lowCount = items.filter(i => i.quantity <= i.low).length;
+  document.getElementById('statLow').innerText = lowCount;
+  // today's sales
+  const today = new Date().toISOString().slice(0,10);
+  const todayTotal = (sales.filter(s => s.date.slice(0,10) === today).reduce((a,b)=> a + parseFloat(b.total), 0) || 0).toFixed(2);
+  document.getElementById('statToday').innerText = todayTotal;
+}
+
+function renderLowList(){
+  const lowList = items.filter(i => i.quantity <= i.low);
+  const container = document.getElementById('lowItemsList');
+  if (lowList.length === 0) container.innerHTML = '<p class="text-muted">Items wanaagsan — ma jiraan wax ku dhow inay dhamaadaan.</p>';
+  else {
+    let html = '<ul class="list-group">';
+    lowList.forEach(i => html += `<li class="list-group-item d-flex justify-content-between">${escapeHtml(i.name)} <span class="text-danger">${i.quantity}</span></li>`);
+    html += '</ul>';
+    container.innerHTML = html;
+  }
+}
+
+function showAlertIfLow() {
+  const low = items.filter(i => i.quantity <= i.low);
+  if (low.length > 0) {
+    const names = low.map(i => `${i.name} (${i.quantity})`).join(', ');
+    Swal.fire({ icon:'warning', title:'Stock Alert', html:`Items ku dhow inay dhammaan: <br><b>${names}</b>`, timer:8000 });
+  }
+}
+
+function renderReports(){
+  sales = load(KEY_SALES);
+  customers = load(KEY_CUSTOMERS);
+  items = load(KEY_ITEMS);
+  // today total
+  const today = new Date().toISOString().slice(0,10);
+  const todayTotal = (sales.filter(s=>s.date.slice(0,10)===today).reduce((a,b)=> a + parseFloat(b.total), 0) || 0).toFixed(2);
+  document.getElementById('reportTodayTotal').innerText = todayTotal;
+  // credits
+  const rc = document.getElementById('reportCredits'); rc.innerHTML = '';
+  if (customers.length === 0) rc.innerHTML = '<li class="list-group-item text-muted">Ma jiraan credit customers</li>';
+  else customers.forEach(c => rc.innerHTML += `<li class="list-group-item d-flex justify-content-between">${escapeHtml(c.name)} <span>${parseFloat(c.balance).toFixed(2)}</span></li>`);
+  // low items
+  const rl = document.getElementById('reportLow'); rl.innerHTML = '';
+  const lowList = items.filter(i => i.quantity <= i.low);
+  if (lowList.length === 0) rl.innerHTML = '<li class="list-group-item text-muted">Ma jiraan items ku dhow inay dhamaadaan</li>';
+  else lowList.forEach(i => rl.innerHTML += `<li class="list-group-item d-flex justify-content-between">${escapeHtml(i.name)} <span>${i.quantity}</span></li>`);
+}
+
+/* initial render */
+renderItemsTable();
+renderSaleItemsList();
+updateStats();
+
+/* if user navigates to views (after login) keep dashboard visible by default */
+if (sessionStorage.getItem('kalk_logged')) {
+  go('dashboard');
+} else {
+  hideAllViews();
+}
+
+/* ================
+   Utility: Export/Import (optional)
+   ================ */
+/* (Not shown in UI by default) You can add export/import if you want to backup data */
+
+</script>
+
+</body>
+</html>
