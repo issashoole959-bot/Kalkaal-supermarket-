@@ -3,17 +3,19 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Kalkaal Supermarket System</title>
+  <title>Kalkaal Supermarket System (v1)</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
   <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
   <style>
     body { background: #f4fbff; }
     .brand { color:#0d6efd; font-weight:700; }
     .low-badge { background:#ffc107; color:#000; padding:3px 7px; border-radius:6px; font-weight:600; }
-    .nav-link { cursor:pointer; }
     .card { box-shadow: 0 1px 4px rgba(13,110,253,0.06); }
     .small-muted { font-size:0.85rem; color:#6c757d; }
     .table-sm td, .table-sm th { vertical-align: middle; }
+    .suggestions { position: absolute; z-index:50; background:#fff; width:100%; border:1px solid #ddd; max-height:200px; overflow:auto; }
+    .suggest-item { padding:8px; cursor:pointer; }
+    .suggest-item:hover { background:#f1f7ff; }
   </style>
 </head>
 <body>
@@ -42,7 +44,7 @@
               </div>
               <button class="btn btn-primary w-100">GALI</button>
             </form>
-            <p class="small-muted mt-2">Username: <b>admin</b> — Password: <b>1234</b></p>
+            <p class="small-muted mt-2">Username: <b>admin</b> — Password: <b>12345</b></p>
           </div>
         </div>
       </div>
@@ -137,11 +139,12 @@
             </div>
 
             <div class="row g-3">
-              <div class="col-md-6">
+              <div class="col-md-6 position-relative">
                 <div class="card p-3">
                   <h6>Item-yada</h6>
                   <input id="saleSearch" class="form-control mb-2" placeholder="Raadi item...">
-                  <div id="saleItemsList" style="max-height:360px; overflow:auto;"></div>
+                  <div id="saleSuggest" class="suggestions" style="display:none;"></div>
+                  <div id="saleItemsList" style="max-height:300px; overflow:auto;"></div>
                 </div>
               </div>
 
@@ -202,15 +205,16 @@
 /* ===========================
    Storage helpers & init
    =========================== */
-const KEY_ITEMS = 'kalk_items_v1';
-const KEY_SALES = 'kalk_sales_v1';
-const KEY_CUSTOMERS = 'kalk_customers_v1';
-const ADMIN_USER = 'admin';
-const ADMIN_PASS = '1234';
+/* Use keys unique to v1 to avoid interfering with v2 */
+const KEY_ITEMS = 'kalk_v1_items';
+const KEY_SALES = 'kalk_v1_sales';
+const KEY_CUSTOMERS = 'kalk_v1_customers';
 
-function load(key) {
-  try { return JSON.parse(localStorage.getItem(key) || '[]'); } catch(e) { return []; }
-}
+/* Admin credentials (v1) */
+const ADMIN_USER = 'admin';
+const ADMIN_PASS = '12345'; // v1 password (hidden in input)
+
+function load(key) { try { return JSON.parse(localStorage.getItem(key) || '[]'); } catch(e) { return []; } }
 function save(key, data) { localStorage.setItem(key, JSON.stringify(data)); }
 function uid(prefix='id') { return prefix + '_' + Date.now() + '_' + Math.floor(Math.random()*9000+1000); }
 
@@ -245,7 +249,7 @@ function showMain() {
 }
 
 function logout() {
-  sessionStorage.removeItem('kalk_logged');
+  sessionStorage.removeItem('kalk_v1_logged');
   location.reload();
 }
 
@@ -255,7 +259,7 @@ document.getElementById('loginForm').addEventListener('submit', function(e){
   const u = document.getElementById('loginUser').value.trim();
   const p = document.getElementById('loginPass').value;
   if (u === ADMIN_USER && p === ADMIN_PASS) {
-    sessionStorage.setItem('kalk_logged','1');
+    sessionStorage.setItem('kalk_v1_logged','1');
     showMain();
     Swal.fire('Sax','Waan ku soo dhaweynayaa','success');
   } else {
@@ -264,7 +268,7 @@ document.getElementById('loginForm').addEventListener('submit', function(e){
 });
 
 /* Auto-login if session */
-if (sessionStorage.getItem('kalk_logged')) {
+if (sessionStorage.getItem('kalk_v1_logged')) {
   document.getElementById('adminName').innerText = ADMIN_USER;
   showMain();
 }
@@ -284,13 +288,9 @@ function hideAllViews() {
 function go(page) {
   hideAllViews();
   if (page === 'dashboard') document.getElementById('dashboardView').style.display = '';
-  if (page === 'items') document.getElementById('itemsView').style.display = '';
-  if (page === 'sales') document.getElementById('salesView').style.display = '';
-  if (page === 'reports') document.getElementById('reportsView').style.display = '';
-  // refresh data for that view
-  if (page === 'items') renderItemsTable();
-  if (page === 'sales') renderSaleItemsList();
-  if (page === 'reports') renderReports();
+  if (page === 'items') { document.getElementById('itemsView').style.display = ''; renderItemsTable(); }
+  if (page === 'sales') { document.getElementById('salesView').style.display = ''; renderSaleItemsList(); }
+  if (page === 'reports') { document.getElementById('reportsView').style.display = ''; renderReports(); }
 }
 
 /* ================
@@ -298,7 +298,6 @@ function go(page) {
    ================ */
 const itemsTable = document.getElementById('itemsTable');
 const addItemForm = document.getElementById('addItemForm');
-const saveItemBtn = document.getElementById('saveItemBtn');
 
 function renderItemsTable(filter='') {
   items = load(KEY_ITEMS);
@@ -320,9 +319,7 @@ function renderItemsTable(filter='') {
   });
 }
 
-function escapeHtml(s) {
-  return String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
-}
+function escapeHtml(s) { return String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;'); }
 
 itemsTable.addEventListener('click', function(e){
   const btn = e.target.closest('button');
@@ -339,19 +336,10 @@ itemsTable.addEventListener('click', function(e){
     document.getElementById('itemLow').value = parseInt(it.low);
     window.scrollTo({top:0, behavior:'smooth'});
   } else if (act === 'del') {
-    Swal.fire({
-      title: 'Ma hubtaa?',
-      text: 'Miyaad rabtaa inaad tirtirto itemkan?',
-      icon: 'warning', showCancelButton:true
-    }).then(res=>{
-      if (res.isConfirmed) {
-        items = items.filter(x=>x.id !== id);
-        save(KEY_ITEMS, items);
-        renderItemsTable(document.getElementById('searchItem').value || '');
-        updateStats();
-        Swal.fire('La tirtiray','Item waa la tirtiray','success');
-      }
-    });
+    Swal.fire({ title:'Ma hubtaa?', text:'Miyaad rabtaa inaad tirtirto itemkan?', icon:'warning', showCancelButton:true })
+    .then(res=>{ if (res.isConfirmed) {
+      items = items.filter(x=>x.id !== id); save(KEY_ITEMS, items); renderItemsTable(document.getElementById('searchItem').value || ''); updateStats(); Swal.fire('La tirtiray','Item waa la tirtiray','success');
+    }});
   }
 });
 
@@ -364,39 +352,28 @@ addItemForm.addEventListener('submit', function(e){
   const qty = parseInt(document.getElementById('itemQty').value) || 0;
   const low = parseInt(document.getElementById('itemLow').value) || 5;
   if (!name) return Swal.fire('Khalad','Fadlan geli magaca item','error');
+  items = load(KEY_ITEMS);
   if (id) {
-    // edit
     items = items.map(it => it.id === id ? {...it, name, price, quantity: qty, low } : it);
     Swal.fire('La cusbooneysiiyey','Item waa la cusbooneysiiyey','success');
   } else {
-    // add
-    const newItem = { id: uid('it'), name, price, quantity: qty, low };
-    items.push(newItem);
+    items.push({ id: uid('it'), name, price, quantity: qty, low });
     Swal.fire('La daray','Item cusub waa la daray','success');
   }
   save(KEY_ITEMS, items);
-  document.getElementById('editItemId').value = '';
-  addItemForm.reset();
-  renderItemsTable();
-  updateStats();
+  document.getElementById('editItemId').value = ''; addItemForm.reset(); renderItemsTable(); updateStats();
 });
 
 /* Search */
-document.getElementById('searchItem').addEventListener('input', function(){
-  renderItemsTable(this.value);
-});
-
-/* show add item btn */
-document.getElementById('showAddItemBtn').addEventListener('click', function(){
-  document.getElementById('editItemId').value = '';
-  addItemForm.reset();
-  window.scrollTo({top:0, behavior:'smooth'});
-});
+document.getElementById('searchItem').addEventListener('input', function(){ renderItemsTable(this.value); });
+document.getElementById('showAddItemBtn').addEventListener('click', function(){ document.getElementById('editItemId').value = ''; addItemForm.reset(); window.scrollTo({top:0, behavior:'smooth'}); });
 
 /* ================
-   Sales (cart)
+   Sales (cart) + Autocomplete
    ================ */
 let cart = [];
+const saleSearch = document.getElementById('saleSearch');
+const saleSuggest = document.getElementById('saleSuggest');
 
 function renderSaleItemsList() {
   items = load(KEY_ITEMS);
@@ -417,225 +394,159 @@ function renderSaleItemsList() {
       </div>`;
     container.appendChild(div);
   });
-  document.getElementById('saleSearch').value = '';
+  saleSearch.value = '';
+  hideSuggest();
 }
 
-/* add to cart from items list */
 document.getElementById('saleItemsList').addEventListener('click', function(e){
-  const btn = e.target.closest('button.addToCart');
-  if (!btn) return;
-  const id = btn.dataset.id;
-  const qtyInput = btn.parentElement.querySelector('.addQty');
-  let q = parseInt(qtyInput.value) || 1;
-  const it = items.find(x=>x.id===id);
-  if (!it) return Swal.fire('Error','Item lama helin','error');
-  if (q > it.quantity) return Swal.fire('Error',`Kaliya ${it.quantity} ayaa la heli karaa`,`error`);
-  addToCart(id, q);
+  const btn = e.target.closest('button.addToCart'); if (!btn) return;
+  const id = btn.dataset.id; const qtyInput = btn.parentElement.querySelector('.addQty'); let q = parseInt(qtyInput.value) || 1;
+  const it = items.find(x=>x.id===id); if (!it) return Swal.fire('Error','Item lama helin','error'); if (q > it.quantity) return Swal.fire('Error',`Kaliya ${it.quantity} ayaa la heli karaa`,`error`);
+  addToCart(id,q);
 });
 
-/* search inside sale items */
-document.getElementById('saleSearch').addEventListener('input', function(){
+saleSearch.addEventListener('input', function(){
   const q = this.value.trim().toLowerCase();
-  document.querySelectorAll('#saleItemsList > div').forEach(div=>{
-    const name = div.querySelector('strong').innerText.toLowerCase();
-    div.style.display = name.includes(q) ? 'flex' : 'none';
+  if (!q) { renderSaleItemsList(); hideSuggest(); return; }
+  items = load(KEY_ITEMS);
+  const matches = items.filter(it => it.name.toLowerCase().includes(q));
+  if (matches.length === 0) { hideSuggest(); renderSaleItemsList(); return; }
+  saleSuggest.innerHTML = '';
+  matches.forEach(m => {
+    const d = document.createElement('div');
+    d.className = 'suggest-item';
+    d.innerHTML = `<strong>${escapeHtml(m.name)}</strong> — ${parseFloat(m.price).toFixed(2)} USD — Qty: ${m.quantity}`;
+    d.dataset.id = m.id;
+    d.addEventListener('click', function(){ addToCart(this.dataset.id, 1); hideSuggest(); saleSearch.value = ''; });
+    saleSuggest.appendChild(d);
   });
+  saleSuggest.style.display = 'block';
 });
+function hideSuggest(){ saleSuggest.style.display = 'none'; saleSuggest.innerHTML = ''; }
 
-/* Cart functions */
-function addToCart(id, q=1) {
-  const it = items.find(x=>x.id===id);
-  if (!it) return;
-  const found = cart.find(x=>x.id===id);
-  if (found) {
-    found.qty += q;
-    if (found.qty > it.quantity) found.qty = it.quantity;
-  } else {
-    cart.push({ id: it.id, name: it.name, price: it.price, qty: q });
-  }
+function addToCart(id,q=1) {
+  const it = items.find(x=>x.id===id); if (!it) return;
+  const found = cart.find(x=>x.id===id); if (found){ found.qty += q; if (found.qty > it.quantity) found.qty = it.quantity; } else cart.push({ id: it.id, name: it.name, price: it.price, qty: q });
   renderCart();
 }
 
-function renderCart() {
+function renderCart(){
   const area = document.getElementById('cartArea');
   if (cart.length === 0) { area.innerHTML = '<p class="text-muted">Cart waa madhan yahay.</p>'; return; }
   let html = `<table class="table table-sm"><thead><tr><th>Item</th><th>Qty</th><th>Unit</th><th>Subtotal</th><th></th></tr></thead><tbody>`;
   let total = 0;
-  cart.forEach((c, idx) => {
-    const sub = c.qty * parseFloat(c.price);
-    total += sub;
-    html += `<tr>
-      <td>${escapeHtml(c.name)}</td>
-      <td><input type="number" min="1" value="${c.qty}" class="form-control form-control-sm cartQty" data-i="${idx}" style="width:90px"></td>
-      <td>${parseFloat(c.price).toFixed(2)}</td>
-      <td>${sub.toFixed(2)}</td>
-      <td><button class="btn btn-sm btn-danger removeLine" data-i="${idx}">x</button></td>
-    </tr>`;
-  });
+  cart.forEach((c, idx) => { const sub = c.qty * parseFloat(c.price); total += sub;
+    html += `<tr><td>${escapeHtml(c.name)}</td><td><input type="number" min="1" value="${c.qty}" class="form-control form-control-sm cartQty" data-i="${idx}" style="width:90px"></td><td>${parseFloat(c.price).toFixed(2)}</td><td>${sub.toFixed(2)}</td><td><button class="btn btn-sm btn-danger removeLine" data-i="${idx}">x</button></td></tr>`; });
   html += `</tbody></table><div class="text-end"><h5>Total: <span id="cartTotal">${total.toFixed(2)}</span> USD</h5></div>`;
   area.innerHTML = html;
 }
 
-/* delegate cart events */
 document.getElementById('cartArea').addEventListener('click', function(e){
-  const btn = e.target.closest('button.removeLine');
-  if (btn) {
-    const i = parseInt(btn.dataset.i);
-    cart.splice(i,1);
-    renderCart();
-    return;
-  }
+  const btn = e.target.closest('button.removeLine'); if (btn){ const i = parseInt(btn.dataset.i); cart.splice(i,1); renderCart(); return; }
 });
 document.getElementById('cartArea').addEventListener('change', function(e){
-  const inp = e.target.closest('input.cartQty');
-  if (!inp) return;
-  const i = parseInt(inp.dataset.i);
-  let v = parseInt(inp.value) || 1;
-  const it = items.find(x=>x.id === cart[i].id);
-  if (v > it.quantity) { Swal.fire('Error','Qty exceeds available stock','error'); inp.value = cart[i].qty; return; }
-  cart[i].qty = v;
-  renderCart();
+  const inp = e.target.closest('input.cartQty'); if (!inp) return; const i = parseInt(inp.dataset.i); let v = parseInt(inp.value) || 1; const it = items.find(x=>x.id === cart[i].id);
+  if (v > it.quantity) { Swal.fire('Error','Qty exceeds available stock','error'); inp.value = cart[i].qty; return; } cart[i].qty = v; renderCart();
 });
 
-/* payment type toggle */
-document.getElementById('paymentType').addEventListener('change', function(){
-  const v = this.value;
-  document.getElementById('creditName').style.display = v === 'Credit' ? '' : 'none';
-});
+document.getElementById('paymentType').addEventListener('change', function(){ document.getElementById('creditName').style.display = this.value === 'Credit' ? '' : 'none'; });
 
-/* save sale */
 document.getElementById('saveSaleBtn').addEventListener('click', function(){
   if (cart.length === 0) return Swal.fire('Error','Cart waa madhan','error');
   const payment = document.getElementById('paymentType').value;
   const custName = document.getElementById('creditName').value.trim();
   if (payment === 'Credit' && !custName) return Swal.fire('Error','Fadlan gali magaca macaamiisha (credit)','error');
 
-  // validate stock again
   items = load(KEY_ITEMS);
-  try {
-    cart.forEach(c => {
-      const it = items.find(x=>x.id===c.id);
-      if (!it) throw new Error(`Item ${c.name} lama helin`);
-      if (c.qty > it.quantity) throw new Error(`Item '${it.name}' kaliya ${it.quantity} ayaa la heli karaa, codsatay ${c.qty}`);
-    });
-  } catch(err) { return Swal.fire('Error', err.message, 'error'); }
+  try { cart.forEach(c => { const it = items.find(x=>x.id===c.id); if (!it) throw new Error(`Item ${c.name} lama helin`); if (c.qty > it.quantity) throw new Error(`Item '${it.name}' kaliya ${it.quantity} ayaa la heli karaa, codsatay ${c.qty}`); }); }
+  catch(err) { return Swal.fire('Error', err.message, 'error'); }
 
-  // compute total
-  let total = 0;
-  cart.forEach(c => total += c.qty * parseFloat(c.price));
-  total = parseFloat(total.toFixed(2));
-
-  // create sale entry
+  let total = 0; cart.forEach(c => total += c.qty * parseFloat(c.price)); total = parseFloat(total.toFixed(2));
   const sale = { id: uid('s'), total, payment, customer: payment==='Credit' ? custName : null, date: new Date().toISOString(), lines: cart.map(c=>({...c})) };
-  sales = load(KEY_SALES);
-  sales.push(sale);
-  save(KEY_SALES, sales);
+  sales = load(KEY_SALES); sales.push(sale); save(KEY_SALES, sales);
 
-  // decrement stock
-  items = items.map(it => {
-    const line = cart.find(l => l.id === it.id);
-    if (line) {
-      return {...it, quantity: it.quantity - line.qty};
-    }
-    return it;
-  });
+  items = items.map(it => { const line = cart.find(l => l.id === it.id); if (line) return {...it, quantity: it.quantity - line.qty}; return it; });
   save(KEY_ITEMS, items);
 
-  // handle credit customer
-  if (payment === 'Credit') {
-    customers = load(KEY_CUSTOMERS);
-    let c = customers.find(x => x.name.toLowerCase() === custName.toLowerCase());
-    if (c) c.balance = parseFloat((parseFloat(c.balance) + total).toFixed(2));
-    else {
-      c = { id: uid('c'), name: custName, balance: total };
-      customers.push(c);
-    }
-    save(KEY_CUSTOMERS, customers);
-  }
+  if (payment === 'Credit') { customers = load(KEY_CUSTOMERS); let c = customers.find(x => x.name.toLowerCase() === custName.toLowerCase()); if (c) c.balance = parseFloat((parseFloat(c.balance) + total).toFixed(2)); else { c = { id: uid('c'), name: custName, balance: total }; customers.push(c); } save(KEY_CUSTOMERS, customers); }
 
-  // clear cart
-  cart = [];
-  renderCart();
-  renderSaleItemsList();
-  renderItemsTable();
-  updateStats();
-  showAlertIfLow();
-  Swal.fire('Saved','Iibka waa la keydiyey','success');
+  cart = []; renderCart(); renderSaleItemsList(); renderItemsTable(); updateStats(); showAlertIfLow(); Swal.fire('Saved','Iibka waa la keydiyey','success');
 });
 
 /* ================
-   Reports & stats
+   Reports & stats + Pay (with admin pass)
    ================ */
 function updateStats(){
-  items = load(KEY_ITEMS);
-  sales = load(KEY_SALES);
-  customers = load(KEY_CUSTOMERS);
+  items = load(KEY_ITEMS); sales = load(KEY_SALES); customers = load(KEY_CUSTOMERS);
   document.getElementById('statItems').innerText = items.length;
-  const lowCount = items.filter(i => i.quantity <= i.low).length;
-  document.getElementById('statLow').innerText = lowCount;
-  // today's sales
+  const lowCount = items.filter(i => i.quantity <= i.low).length; document.getElementById('statLow').innerText = lowCount;
   const today = new Date().toISOString().slice(0,10);
   const todayTotal = (sales.filter(s => s.date.slice(0,10) === today).reduce((a,b)=> a + parseFloat(b.total), 0) || 0).toFixed(2);
   document.getElementById('statToday').innerText = todayTotal;
 }
 
-function renderLowList(){
-  const lowList = items.filter(i => i.quantity <= i.low);
-  const container = document.getElementById('lowItemsList');
-  if (lowList.length === 0) container.innerHTML = '<p class="text-muted">Items wanaagsan — ma jiraan wax ku dhow inay dhamaadaan.</p>';
-  else {
-    let html = '<ul class="list-group">';
-    lowList.forEach(i => html += `<li class="list-group-item d-flex justify-content-between">${escapeHtml(i.name)} <span class="text-danger">${i.quantity}</span></li>`);
-    html += '</ul>';
-    container.innerHTML = html;
-  }
-}
+function renderLowList(){ const lowList = items.filter(i => i.quantity <= i.low); const container = document.getElementById('lowItemsList'); if (lowList.length === 0) container.innerHTML = '<p class="text-muted">Items wanaagsan — ma jiraan wax ku dhow inay dhamaadaan.</p>'; else { let html = '<ul class="list-group">'; lowList.forEach(i => html += `<li class="list-group-item d-flex justify-content-between">${escapeHtml(i.name)} <span class="text-danger">${i.quantity}</span></li>`); html += '</ul>'; container.innerHTML = html; } }
 
-function showAlertIfLow() {
-  const low = items.filter(i => i.quantity <= i.low);
-  if (low.length > 0) {
-    const names = low.map(i => `${i.name} (${i.quantity})`).join(', ');
-    Swal.fire({ icon:'warning', title:'Stock Alert', html:`Items ku dhow inay dhammaan: <br><b>${names}</b>`, timer:8000 });
-  }
-}
+function showAlertIfLow() { const low = items.filter(i => i.quantity <= i.low); if (low.length > 0) { const names = low.map(i => `${i.name} (${i.quantity})`).join(', '); Swal.fire({ icon:'warning', title:'Stock Alert', html:`Items ku dhow inay dhammaan: <br><b>${names}</b>`, timer:8000 }); } }
 
 function renderReports(){
-  sales = load(KEY_SALES);
-  customers = load(KEY_CUSTOMERS);
-  items = load(KEY_ITEMS);
-  // today total
+  sales = load(KEY_SALES); customers = load(KEY_CUSTOMERS); items = load(KEY_ITEMS);
   const today = new Date().toISOString().slice(0,10);
   const todayTotal = (sales.filter(s=>s.date.slice(0,10)===today).reduce((a,b)=> a + parseFloat(b.total), 0) || 0).toFixed(2);
   document.getElementById('reportTodayTotal').innerText = todayTotal;
-  // credits
   const rc = document.getElementById('reportCredits'); rc.innerHTML = '';
-  if (customers.length === 0) rc.innerHTML = '<li class="list-group-item text-muted">Ma jiraan credit customers</li>';
-  else customers.forEach(c => rc.innerHTML += `<li class="list-group-item d-flex justify-content-between">${escapeHtml(c.name)} <span>${parseFloat(c.balance).toFixed(2)}</span></li>`);
-  // low items
+  if (customers.length === 0) rc.innerHTML = '<li class="list-group-item text-muted'>Ma jiraan credit customers</li>';
+  else customers.forEach(c => {
+    const li = document.createElement('li');
+    li.className = 'list-group-item d-flex justify-content-between align-items-center';
+    li.innerHTML = `<div>${escapeHtml(c.name)} <br><small class="text-muted">Balance: ${parseFloat(c.balance).toFixed(2)} USD</small></div><div><button class="btn btn-sm btn-success me-2 payBtn" data-id="${c.id}">Pay</button></div>`;
+    rc.appendChild(li);
+  });
+
   const rl = document.getElementById('reportLow'); rl.innerHTML = '';
   const lowList = items.filter(i => i.quantity <= i.low);
   if (lowList.length === 0) rl.innerHTML = '<li class="list-group-item text-muted">Ma jiraan items ku dhow inay dhamaadaan</li>';
   else lowList.forEach(i => rl.innerHTML += `<li class="list-group-item d-flex justify-content-between">${escapeHtml(i.name)} <span>${i.quantity}</span></li>`);
 }
 
+/* Pay flow */
+document.getElementById('reportCredits').addEventListener('click', function(e){
+  const btn = e.target.closest('button.payBtn');
+  if (!btn) return;
+  const cid = btn.dataset.id; customers = load(KEY_CUSTOMERS); const cust = customers.find(x=>x.id === cid);
+  if (!cust) return Swal.fire('Error','Customer lama helin','error');
+
+  Swal.fire({
+    title: `Bixin deynta: ${cust.name}`,
+    html: `<input id="sw-amount" type="number" class="swal2-input" placeholder="Lacag (USD)" min="0.01" step="0.01"><input id="sw-pass" type="password" class="swal2-input" placeholder="Geli password admin">`,
+    showCancelButton: true,
+    confirmButtonText: 'Bixi',
+    preConfirm: () => {
+      const amount = parseFloat(document.getElementById('sw-amount').value);
+      const pass = document.getElementById('sw-pass').value;
+      if (!amount || amount <= 0) { Swal.showValidationMessage('Fadlan geli lacag sax ah'); return false; }
+      if (amount > parseFloat(cust.balance)) { Swal.showValidationMessage('Lacagta way ka badan tahay balance-ka'); return false; }
+      if (!pass) { Swal.showValidationMessage('Fadlan geli password'); return false; }
+      if (pass !== ADMIN_PASS) { Swal.showValidationMessage('Password khalad ah'); return false; }
+      return { amount, pass };
+    }
+  }).then(result => {
+    if (result.isConfirmed && result.value) {
+      const { amount } = result.value;
+      customers = load(KEY_CUSTOMERS);
+      const cc = customers.find(x=>x.id === cid);
+      cc.balance = parseFloat((parseFloat(cc.balance) - amount).toFixed(2));
+      if (cc.balance < 0.005) cc.balance = 0;
+      save(KEY_CUSTOMERS, customers);
+      sales = load(KEY_SALES); sales.push({ id: uid('p'), type:'Payment', customer: cc.name, amount: amount, date: new Date().toISOString() }); save(KEY_SALES, sales);
+      renderReports(); updateStats(); Swal.fire('La bixiyey','Lacagta waa la xaqiijiyey','success');
+    }
+  });
+});
+
 /* initial render */
-renderItemsTable();
-renderSaleItemsList();
-updateStats();
-
-/* if user navigates to views (after login) keep dashboard visible by default */
-if (sessionStorage.getItem('kalk_logged')) {
-  go('dashboard');
-} else {
-  hideAllViews();
-}
-
-/* ================
-   Utility: Export/Import (optional)
-   ================ */
-/* (Not shown in UI by default) You can add export/import if you want to backup data */
-
+renderItemsTable(); renderSaleItemsList(); updateStats();
+if (sessionStorage.getItem('kalk_v1_logged')) { go('dashboard'); } else { hideAllViews(); }
 </script>
-
 </body>
 </html>
